@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Language Detector</title><link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header><span class="eyebrow">ML LANGUAGE LAB</span><h1>Language<br><em>Detector</em></h1><p class="intro">Paste a sentence and let a lightweight local model make a prediction.</p></header>
+    <section class="card input-card"><label for="text">Text to analyze</label><textarea id="text" maxlength="5000" placeholder="Try: Bonjour, comment allez-vous aujourd'hui ?"></textarea><div class="controls"><span id="counter">0 / 5000</span><button id="detect">Detect language <span>→</span></button></div><p id="error" class="error" role="alert"></p></section>
+    <section id="result" class="card result-card hidden" aria-live="polite"><div class="result-heading"><div><span class="eyebrow">PREDICTION</span><h2 id="language">—</h2></div><div class="confidence"><strong id="confidence">—</strong><span>confidence</span></div></div><p id="notice" class="notice"></p><div class="probabilities"><h3>Top probabilities</h3><div id="bars"></div></div></section>
+    <footer>Character n-gram TF-IDF + Naive Bayes <span>·</span> Results are predictions</footer>
+  </main><script src="/static/app.js"></script>
+</body></html>
