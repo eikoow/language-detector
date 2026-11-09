@@ -32,9 +32,8 @@ jobs:
           $newPort = 18001
           $configPath = Join-Path $env:RUNNER_TEMP 'language-detector-nginx.conf'
 
-          # Korean test sentence written with unicode escapes so the script file
-          # encoding cannot break it ("안녕하세요 반갑습니다").
-          $koreanText = [regex]::Unescape('안녕하세요 반갑습니다')
+          # Korean test sentence written as unicode escapes so the file stays ASCII-only.
+          $koreanText = [regex]::Unescape('\uC548\uB155\uD558\uC138\uC694 \uBC18\uAC11\uC2B5\uB2C8\uB2E4')
 
           function Test-Detect([string]$baseUrl) {
             $json = @{ text = $koreanText } | ConvertTo-Json
@@ -126,7 +125,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8001/health' -TimeoutSec 10
           if ($health.status -ne 'ok') { throw 'Health check failed.' }
-          $koreanText = [regex]::Unescape('안녕하세요 반갑습니다')
+          $koreanText = [regex]::Unescape('\uC548\uB155\uD558\uC138\uC694 \uBC18\uAC11\uC2B5\uB2C8\uB2E4')
           $bytes = [System.Text.Encoding]::UTF8.GetBytes((@{ text = $koreanText } | ConvertTo-Json))
           $result = Invoke-RestMethod -Uri 'http://127.0.0.1:8001/detect' -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 10
           if ($result.language -ne 'Korean') { throw "Expected Korean, got: $($result.language)" }
