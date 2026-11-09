@@ -20,7 +20,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Pull and deploy image
+      - name: Pull and deploy image (zero-downtime)
         env:
           IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/language-detector:latest
         run: |
@@ -32,26 +32,41 @@ jobs:
           $newPort = 18001
           $configPath = Join-Path $env:RUNNER_TEMP 'language-detector-nginx.conf'
 
-          docker pull $env:IMAGE
+          # Korean test sentence written with unicode escapes so the script file
+          # encoding cannot break it ("안녕하세요 반갑습니다").
+          $koreanText = [regex]::Unescape('안녕하세요 반갑습니다')
 
-          docker network inspect $network *> $null
-          if ($LASTEXITCODE -ne 0) {
-            docker network create $network
+          function Test-Detect([string]$baseUrl) {
+            $json = @{ text = $koreanText } | ConvertTo-Json
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+            $r = Invoke-RestMethod -Uri "$baseUrl/detect" -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 10
+            return $r.language
           }
 
-          # A failed previous deployment can leave this candidate behind. The
-          # stable app container is never removed until the new one is ready.
-          docker rm -f $new 2>$null | Out-Null
+          function Test-ContainerExists([string]$name) {
+            $id = docker ps -aq --filter "name=^/${name}$"
+            return [bool]$id
+          }
+
+          docker pull $env:IMAGE
+          if ($LASTEXITCODE -ne 0) { throw 'docker pull failed.' }
+
+          # Create the network only if it does not exist (no stderr redirection,
+          # which Windows PowerShell 5.1 turns into a terminating error).
+          $netExists = docker network ls -q --filter "name=^${network}$"
+          if (-not $netExists) { docker network create $network | Out-Null }
+
+          # A failed previous deployment can leave the candidate behind.
+          if (Test-ContainerExists $new) { docker rm -f $new | Out-Null }
+
           docker run -d --name $new --network $network -p "${newPort}:8000" $env:IMAGE
+          if ($LASTEXITCODE -ne 0) { throw 'Starting the new container failed.' }
 
           $ready = $false
           for ($attempt = 1; $attempt -le 30; $attempt++) {
             try {
               $health = Invoke-RestMethod -Uri "http://127.0.0.1:${newPort}/health" -TimeoutSec 3
-              if ($health.status -eq 'ok') {
-                $ready = $true
-                break
-              }
+              if ($health.status -eq 'ok') { $ready = $true; break }
             } catch {
               # The application trains its model during startup.
             }
@@ -76,46 +91,43 @@ jobs:
                       proxy_set_header Host `$host;
                       proxy_set_header X-Real-IP `$remote_addr;
                       proxy_set_header X-Forwarded-For `$proxy_add_x_forwarded_for;
-                      proxy_set_header X-Forwarded-Proto `$scheme;
                   }
               }
           }
           "@ | Set-Content -Path $configPath -Encoding ascii
 
-          $proxyExists = docker ps -aq --filter "name=^/${proxy}$"
-          if (-not $proxyExists) {
+          if (-not (Test-ContainerExists $proxy)) {
             docker run -d --name $proxy --network $network -p 8001:8001 nginx:1.27-alpine
-            Start-Sleep -Seconds 2
+            if ($LASTEXITCODE -ne 0) { throw 'Starting the nginx proxy failed.' }
+            Start-Sleep -Seconds 3
           } elseif ((docker inspect -f '{{.State.Running}}' $proxy) -ne 'true') {
-            docker start $proxy
-            Start-Sleep -Seconds 2
+            docker start $proxy | Out-Null
+            Start-Sleep -Seconds 3
           }
 
           docker cp $configPath "${proxy}:/etc/nginx/nginx.conf"
           docker exec $proxy nginx -t
+          if ($LASTEXITCODE -ne 0) { throw 'nginx config test failed.' }
           docker exec $proxy nginx -s reload
+          Start-Sleep -Seconds 2
 
           $stableHealth = Invoke-RestMethod -Uri 'http://127.0.0.1:8001/health' -TimeoutSec 10
-          if ($stableHealth.status -ne 'ok') {
-            throw 'The stable URL did not return a healthy response after switching.'
-          }
+          if ($stableHealth.status -ne 'ok') { throw 'Stable URL is not healthy after switching.' }
+          $lang = Test-Detect 'http://127.0.0.1:8001'
+          if ($lang -ne 'Korean') { throw "Expected Korean detection, got: $lang" }
 
-          $payload = @{ text = '안녕하세요 오늘 날씨가 정말 좋습니다.' } | ConvertTo-Json
-          $detected = Invoke-RestMethod -Uri 'http://127.0.0.1:8001/detect' -Method Post -ContentType 'application/json' -Body $payload -TimeoutSec 10
-          if ($detected.language -ne 'Korean') {
-            throw "Expected Korean detection, got: $($detected.language)"
-          }
-
-          # The proxy is serving the new IP at this point, so the old app can
-          # now be removed without interrupting requests.
-          docker rm -f $current 2>$null | Out-Null
+          # The proxy now serves the new container, so the old one can be removed.
+          if (Test-ContainerExists $current) { docker rm -f $current | Out-Null }
           docker rename $new $current
+          Write-Output "Deployed $env:IMAGE -> http://127.0.0.1:8001 (detected: $lang)"
 
       - name: Verify deployed service
         run: |
           $ErrorActionPreference = 'Stop'
           $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8001/health' -TimeoutSec 10
           if ($health.status -ne 'ok') { throw 'Health check failed.' }
-          $payload = @{ text = '안녕하세요 오늘 날씨가 정말 좋습니다.' } | ConvertTo-Json
-          $result = Invoke-RestMethod -Uri 'http://127.0.0.1:8001/detect' -Method Post -ContentType 'application/json' -Body $payload -TimeoutSec 10
+          $koreanText = [regex]::Unescape('안녕하세요 반갑습니다')
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes((@{ text = $koreanText } | ConvertTo-Json))
+          $result = Invoke-RestMethod -Uri 'http://127.0.0.1:8001/detect' -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 10
           if ($result.language -ne 'Korean') { throw "Expected Korean, got: $($result.language)" }
+          Write-Output "Service OK: health=ok, detect=$($result.language)"
