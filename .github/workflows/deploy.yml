@@ -15,6 +15,75 @@ jobs:
       run:
         shell: powershell
     steps:
+      - name: Start zero-downtime monitor
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $monitorLog = Join-Path $env:RUNNER_TEMP 'language-detector-monitor.csv'
+          $stopFile = Join-Path $env:RUNNER_TEMP 'language-detector-monitor.stop'
+          $pidFile = Join-Path $env:RUNNER_TEMP 'language-detector-monitor.pid'
+          $deploymentStart = Join-Path $env:RUNNER_TEMP 'language-detector-deployment.start'
+          $deploymentEnd = Join-Path $env:RUNNER_TEMP 'language-detector-deployment.end'
+          Remove-Item -LiteralPath $monitorLog,$stopFile,$pidFile,$deploymentStart,$deploymentEnd -Force -ErrorAction SilentlyContinue
+          $monitorScriptPath = Join-Path $env:RUNNER_TEMP 'language-detector-monitor.ps1'
+          $bootstrapPath = Join-Path $env:RUNNER_TEMP 'language-detector-monitor-bootstrap.ps1'
+          $monitorScript = @'
+          param([string]$LogPath, [string]$StopPath, [string]$Text)
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          $writer = New-Object System.IO.StreamWriter($LogPath, $false, $utf8)
+          function Csv([object]$Value) { return ('"' + ([string]$Value).Replace('"','""') + '"') }
+          $writer.WriteLine('start_utc,end_utc,response_ms,http_status,valid,model_version,error')
+          $afterUntil = $null
+          try {
+              while ($true) {
+                  $started = [DateTime]::UtcNow
+                  $status = 0
+                  $valid = $false
+                  $version = 'unknown'
+                  $errorText = ''
+                  try {
+                      $json = @{ text = $Text } | ConvertTo-Json -Compress
+                      $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                      $response = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8001/detect' -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 10
+                      $status = [int]$response.StatusCode
+                      $data = $response.Content | ConvertFrom-Json
+                      $version = [string]$data.model_version
+                      $valid = ($status -eq 200 -and $data.language -eq 'Korean' -and $data.is_prediction -eq $true)
+                  } catch {
+                      $errorText = $_.Exception.Message.Replace("`r",' ').Replace("`n",' ')
+                      if ($_.Exception.Response) {
+                          try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+                      }
+                  }
+                  $ended = [DateTime]::UtcNow
+                  $elapsed = [Math]::Round(($ended - $started).TotalMilliseconds, 2)
+                  $fields = @((Csv ($started.ToString('o'))), (Csv ($ended.ToString('o'))), (Csv $elapsed), (Csv $status), (Csv $valid), (Csv $version), (Csv $errorText))
+                  $writer.WriteLine(($fields -join ','))
+                  $writer.Flush()
+                  if (Test-Path -LiteralPath $StopPath) {
+                      if (-not $afterUntil) { $afterUntil = [DateTime]::UtcNow.AddSeconds(30) }
+                      if ([DateTime]::UtcNow -ge $afterUntil) { break }
+                  }
+                  Start-Sleep -Seconds 1
+              }
+          } finally {
+              $writer.Dispose()
+          }
+          '@
+          $bootstrap = @'
+          param([string]$MonitorScript, [string]$LogPath, [string]$StopPath, [string]$Text)
+          $job = Start-Job -FilePath $MonitorScript -ArgumentList $LogPath,$StopPath,$Text
+          Wait-Job -Id $job.Id | Out-Null
+          Receive-Job -Id $job.Id | Out-Null
+          Remove-Job -Id $job.Id -Force
+          '@
+          Set-Content -LiteralPath $monitorScriptPath -Value $monitorScript -Encoding ASCII
+          Set-Content -LiteralPath $bootstrapPath -Value $bootstrap -Encoding ASCII
+          $koreanText = [regex]::Unescape('\uC548\uB155\uD558\uC138\uC694 \uBC18\uAC11\uC2B5\uB2C8\uB2E4')
+          $monitorProcess = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$bootstrapPath,'-MonitorScript',$monitorScriptPath,'-LogPath',$monitorLog,'-StopPath',$stopFile,'-Text',$koreanText)
+          Set-Content -LiteralPath $pidFile -Value $monitorProcess.Id -Encoding ASCII
+          Start-Sleep -Seconds 2
+          Set-Content -LiteralPath $deploymentStart -Value ([DateTime]::UtcNow.ToString('o')) -Encoding ASCII
+
       - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -31,51 +100,29 @@ jobs:
           $new = 'language-detector-app-new'
           $newPort = 18001
           $configPath = Join-Path $env:RUNNER_TEMP 'language-detector-nginx.conf'
-
-          # Korean test sentence written as unicode escapes so the file stays ASCII-only.
           $koreanText = [regex]::Unescape('\uC548\uB155\uD558\uC138\uC694 \uBC18\uAC11\uC2B5\uB2C8\uB2E4')
-
+          function Test-ContainerExists([string]$name) { return [bool](docker ps -aq --filter "name=^/${name}$") }
           function Test-Detect([string]$baseUrl) {
-            $json = @{ text = $koreanText } | ConvertTo-Json
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-            $r = Invoke-RestMethod -Uri "$baseUrl/detect" -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 10
-            return $r.language
+              $json = @{ text = $koreanText } | ConvertTo-Json -Compress
+              $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+              return Invoke-RestMethod -Uri "$baseUrl/detect" -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 10
           }
-
-          function Test-ContainerExists([string]$name) {
-            $id = docker ps -aq --filter "name=^/${name}$"
-            return [bool]$id
-          }
-
           docker pull $env:IMAGE
           if ($LASTEXITCODE -ne 0) { throw 'docker pull failed.' }
-
-          # Create the network only if it does not exist (no stderr redirection,
-          # which Windows PowerShell 5.1 turns into a terminating error).
           $netExists = docker network ls -q --filter "name=^${network}$"
           if (-not $netExists) { docker network create $network | Out-Null }
-
-          # A failed previous deployment can leave the candidate behind.
           if (Test-ContainerExists $new) { docker rm -f $new | Out-Null }
-
           docker run -d --name $new --network $network -p "${newPort}:8000" $env:IMAGE
           if ($LASTEXITCODE -ne 0) { throw 'Starting the new container failed.' }
-
           $ready = $false
           for ($attempt = 1; $attempt -le 30; $attempt++) {
-            try {
-              $health = Invoke-RestMethod -Uri "http://127.0.0.1:${newPort}/health" -TimeoutSec 3
-              if ($health.status -eq 'ok') { $ready = $true; break }
-            } catch {
-              # The application trains its model during startup.
-            }
-            Start-Sleep -Seconds 2
+              try {
+                  $health = Invoke-RestMethod -Uri "http://127.0.0.1:${newPort}/health" -TimeoutSec 3
+                  if ($health.status -eq 'ok') { $ready = $true; break }
+              } catch { }
+              Start-Sleep -Seconds 2
           }
-          if (-not $ready) {
-            docker logs $new
-            throw 'The new application container did not become healthy.'
-          }
-
+          if (-not $ready) { docker logs $new; throw 'New container did not become healthy.' }
           $newIp = docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $new
           @"
           events {}
@@ -93,40 +140,73 @@ jobs:
                   }
               }
           }
-          "@ | Set-Content -Path $configPath -Encoding ascii
-
+          "@ | Set-Content -Path $configPath -Encoding ASCII
           if (-not (Test-ContainerExists $proxy)) {
-            docker run -d --name $proxy --network $network -p 8001:8001 nginx:1.27-alpine
-            if ($LASTEXITCODE -ne 0) { throw 'Starting the nginx proxy failed.' }
-            Start-Sleep -Seconds 3
+              docker run -d --name $proxy --network $network -p 8001:8001 nginx:1.27-alpine
+              if ($LASTEXITCODE -ne 0) { throw 'Starting nginx failed.' }
+              Start-Sleep -Seconds 3
           } elseif ((docker inspect -f '{{.State.Running}}' $proxy) -ne 'true') {
-            docker start $proxy | Out-Null
-            Start-Sleep -Seconds 3
+              docker start $proxy | Out-Null
+              Start-Sleep -Seconds 3
           }
-
           docker cp $configPath "${proxy}:/etc/nginx/nginx.conf"
           docker exec $proxy nginx -t
           if ($LASTEXITCODE -ne 0) { throw 'nginx config test failed.' }
           docker exec $proxy nginx -s reload
           Start-Sleep -Seconds 2
-
           $stableHealth = Invoke-RestMethod -Uri 'http://127.0.0.1:8001/health' -TimeoutSec 10
           if ($stableHealth.status -ne 'ok') { throw 'Stable URL is not healthy after switching.' }
-          $lang = Test-Detect 'http://127.0.0.1:8001'
-          if ($lang -ne 'Korean') { throw "Expected Korean detection, got: $lang" }
-
-          # The proxy now serves the new container, so the old one can be removed.
+          $result = Test-Detect 'http://127.0.0.1:8001'
+          if ($result.language -ne 'Korean') { throw "Expected Korean detection, got: $($result.language)" }
           if (Test-ContainerExists $current) { docker rm -f $current | Out-Null }
           docker rename $new $current
-          Write-Output "Deployed $env:IMAGE -> http://127.0.0.1:8001 (detected: $lang)"
 
-      - name: Verify deployed service
+      - name: Mark deployment end
+        if: always()
+        run: Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'language-detector-deployment.end') -Value ([DateTime]::UtcNow.ToString('o')) -Encoding ASCII
+
+      - name: Stop monitor and write summary
+        if: always()
         run: |
           $ErrorActionPreference = 'Stop'
-          $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8001/health' -TimeoutSec 10
-          if ($health.status -ne 'ok') { throw 'Health check failed.' }
-          $koreanText = [regex]::Unescape('\uC548\uB155\uD558\uC138\uC694 \uBC18\uAC11\uC2B5\uB2C8\uB2E4')
-          $bytes = [System.Text.Encoding]::UTF8.GetBytes((@{ text = $koreanText } | ConvertTo-Json))
-          $result = Invoke-RestMethod -Uri 'http://127.0.0.1:8001/detect' -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 10
-          if ($result.language -ne 'Korean') { throw "Expected Korean, got: $($result.language)" }
-          Write-Output "Service OK: health=ok, detect=$($result.language)"
+          $stopFile = Join-Path $env:RUNNER_TEMP 'language-detector-monitor.stop'
+          $pidFile = Join-Path $env:RUNNER_TEMP 'language-detector-monitor.pid'
+          $log = Join-Path $env:RUNNER_TEMP 'language-detector-monitor.csv'
+          Set-Content -LiteralPath $stopFile -Value 'stop' -Encoding ASCII
+          if (Test-Path -LiteralPath $pidFile) {
+              $monitorPid = [int](Get-Content -LiteralPath $pidFile)
+              try { Wait-Process -Id $monitorPid -Timeout 45 -ErrorAction Stop } catch { }
+          }
+          $rows = @()
+          if (Test-Path -LiteralPath $log) { $rows = @(Import-Csv -LiteralPath $log) }
+          $startPath = Join-Path $env:RUNNER_TEMP 'language-detector-deployment.start'
+          $endPath = Join-Path $env:RUNNER_TEMP 'language-detector-deployment.end'
+          $start = if (Test-Path -LiteralPath $startPath) { [DateTime]::Parse((Get-Content $startPath)).ToUniversalTime() } else { [DateTime]::UtcNow }
+          $end = if (Test-Path -LiteralPath $endPath) { [DateTime]::Parse((Get-Content $endPath)).ToUniversalTime() } else { [DateTime]::UtcNow }
+          $after = $end.AddSeconds(30)
+          $success = @($rows | Where-Object { $_.valid -eq 'True' -and $_.http_status -eq '200' }).Count
+          $failure = $rows.Count - $success
+          $gaps = @()
+          for ($i = 1; $i -lt $rows.Count; $i++) { $gaps += (([DateTime]::Parse($rows[$i].start_utc) - [DateTime]::Parse($rows[$i-1].end_utc)).TotalSeconds) }
+          $largestGap = if ($gaps.Count) { [Math]::Round(($gaps | Measure-Object -Maximum).Maximum, 2) } else { 0 }
+          function Phase([DateTime]$t) { if ($t -lt $start) { 'Before' } elseif ($t -le $end) { 'During' } elseif ($t -le $after) { 'After' } else { 'Other' } }
+          $summary = @('# Language Detector deployment monitor','',"Stable URL: http://127.0.0.1:8001",("Window (UTC): {0} to {1}; deployment: {2} to {3}; after: 30 seconds" -f $start,$after,$start,$end),'','| Phase | Requests ok/total | Representative | HTTP | Version |','|---|---:|---|---:|---|')
+          foreach ($phase in @('Before','During','After')) {
+              $phaseRows = @($rows | Where-Object { (Phase ([DateTime]::Parse($_.start_utc))) -eq $phase })
+              $ok = @($phaseRows | Where-Object { $_.valid -eq 'True' -and $_.http_status -eq '200' }).Count
+              $rep = if ($phaseRows.Count) { $phaseRows[0] } else { $null }
+              $repText = if ($rep) { "$($rep.response_ms) ms" } else { 'none' }
+              $http = if ($rep) { $rep.http_status } else { '-' }
+              $version = if ($rep) { $rep.model_version } else { '-' }
+              $summary += "| $phase | $ok/$($phaseRows.Count) | $repText | $http | $version |"
+          }
+          $summary += @('',"Total successes: $success","Total failures: $failure","Largest gap between records: $largestGap seconds")
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($summary -join [Environment]::NewLine) -Encoding UTF8
+
+      - name: Upload monitor log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: language-detector-deployment-monitor
+          path: ${{ runner.temp }}/language-detector-monitor.csv
+          if-no-files-found: warn

@@ -1,5 +1,7 @@
 from pathlib import Path
 from typing import Any
+import re
+import unicodedata
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -23,6 +25,8 @@ LANGUAGES = {
     "de": "German",
 }
 
+MODEL_VERSION = "v2"
+
 EXAMPLES = {
     "ko": ["안녕하세요 오늘 날씨가 정말 좋습니다.", "저는 한국어를 공부하고 있습니다.", "맛있는 저녁을 먹고 공원에 갔어요."],
     "en": ["Hello, the weather is beautiful today.", "I am learning about language detection.", "Please enjoy your evening and have a good day."],
@@ -35,11 +39,18 @@ EXAMPLES = {
 }
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def prepare_text(text: str) -> str:
+    """Normalize Unicode and whitespace, especially useful for short inputs."""
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text)).strip().casefold()
+
+
 model = Pipeline([
-    ("tfidf", TfidfVectorizer(analyzer="char", ngram_range=(2, 5), sublinear_tf=True)),
+    ("tfidf", TfidfVectorizer(analyzer="char", ngram_range=(1, 5), sublinear_tf=True)),
     ("classifier", MultinomialNB(alpha=0.1)),
 ])
-training_texts = [text for samples in TRAINING_EXAMPLES.values() for text in samples]
+training_texts = [prepare_text(text) for samples in TRAINING_EXAMPLES.values() for text in samples]
 training_labels = [language for language, samples in TRAINING_EXAMPLES.items() for _ in samples]
 model.fit(training_texts, training_labels)
 
@@ -65,6 +76,7 @@ def health() -> dict[str, str]:
 def model_info() -> dict[str, Any]:
     return {
         "algorithm": "Character n-gram TF-IDF + Multinomial Naive Bayes",
+        "model_version": MODEL_VERSION,
         "training_examples": len(training_texts),
         "languages": list(LANGUAGES.values()),
         "prediction_notice": "Results are predictions from a small startup-trained model.",
@@ -73,7 +85,7 @@ def model_info() -> dict[str, Any]:
 
 @app.post("/detect")
 def detect(request: DetectRequest) -> dict[str, Any]:
-    text = request.text.strip()
+    text = prepare_text(request.text)
     if not text:
         from fastapi import HTTPException
         raise HTTPException(status_code=422, detail="Please enter some text to analyze.")
@@ -84,6 +96,7 @@ def detect(request: DetectRequest) -> dict[str, Any]:
     return {
         "language": LANGUAGES[top_language],
         "language_code": top_language,
+        "model_version": MODEL_VERSION,
         "confidence": round(float(top_probability), 4),
         "top_languages": [
             {"language": LANGUAGES[code], "language_code": code, "probability": round(float(prob), 4)}

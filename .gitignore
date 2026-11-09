@@ -15,3 +15,12 @@ config.sh
 run.sh
 runsvc.sh
 language-detector-nginx*.conf
+mlops/.cache/
+mlops/cache/
+mlops/data/
+mlops/downloads/
+mlops/*.log
+mlops/*.json
+mlops/*.csv
+*.parquet
+*.arrow
