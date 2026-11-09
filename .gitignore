@@ -2,3 +2,16 @@ __pycache__/
 .pytest_cache/
 *.pyc
 browser-profile/
+.runner
+.credentials
+.credentials_rsaparams
+.service
+_work/
+_diag/
+_temp/
+bin/
+externals/
+config.sh
+run.sh
+runsvc.sh
+language-detector-nginx*.conf
