@@ -9,6 +9,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.pipeline import Pipeline
 
+from training_data import EXAMPLES as TRAINING_EXAMPLES
+
 
 LANGUAGES = {
     "ko": "Korean",
@@ -37,8 +39,8 @@ model = Pipeline([
     ("tfidf", TfidfVectorizer(analyzer="char", ngram_range=(2, 5), sublinear_tf=True)),
     ("classifier", MultinomialNB(alpha=0.1)),
 ])
-training_texts = [text for samples in EXAMPLES.values() for text in samples]
-training_labels = [language for language, samples in EXAMPLES.items() for _ in samples]
+training_texts = [text for samples in TRAINING_EXAMPLES.values() for text in samples]
+training_labels = [language for language, samples in TRAINING_EXAMPLES.items() for _ in samples]
 model.fit(training_texts, training_labels)
 
 app = FastAPI(title="Language Detector", version="1.0.0")
