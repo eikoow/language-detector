@@ -31,11 +31,13 @@ jobs:
           $utf8 = New-Object System.Text.UTF8Encoding($false)
           $writer = New-Object System.IO.StreamWriter($LogPath, $false, $utf8)
           function Csv([object]$Value) { return ('"' + ([string]$Value).Replace('"','""') + '"') }
-          $writer.WriteLine('start_utc,end_utc,response_ms,http_status,valid,model_version,error')
+          $writer.WriteLine('request_number,start_ms,end_ms,response_ms,http_status,valid,model_version,error')
           $afterUntil = $null
+          $requestNumber = 0
           try {
               while ($true) {
-                  $started = [DateTime]::UtcNow
+                  $requestNumber++
+                  $startedMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
                   $status = 0
                   $valid = $false
                   $version = 'unknown'
@@ -46,22 +48,25 @@ jobs:
                       $response = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8001/detect' -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 10
                       $status = [int]$response.StatusCode
                       $data = $response.Content | ConvertFrom-Json
-                      $version = [string]$data.model_version
                       $valid = ($status -eq 200 -and $data.language -eq 'Korean' -and $data.is_prediction -eq $true)
+                      try {
+                          $info = Invoke-RestMethod -Uri 'http://127.0.0.1:8001/model-info' -TimeoutSec 10
+                          $version = [string]$info.model_version
+                      } catch { $version = 'unknown' }
                   } catch {
                       $errorText = $_.Exception.Message.Replace("`r",' ').Replace("`n",' ')
                       if ($_.Exception.Response) {
                           try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
                       }
                   }
-                  $ended = [DateTime]::UtcNow
-                  $elapsed = [Math]::Round(($ended - $started).TotalMilliseconds, 2)
-                  $fields = @((Csv ($started.ToString('o'))), (Csv ($ended.ToString('o'))), (Csv $elapsed), (Csv $status), (Csv $valid), (Csv $version), (Csv $errorText))
+                  $endedMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+                  $elapsed = $endedMs - $startedMs
+                  $fields = @((Csv $requestNumber), (Csv $startedMs), (Csv $endedMs), (Csv $elapsed), (Csv $status), (Csv $valid), (Csv $version), (Csv $errorText))
                   $writer.WriteLine(($fields -join ','))
                   $writer.Flush()
                   if (Test-Path -LiteralPath $StopPath) {
-                      if (-not $afterUntil) { $afterUntil = [DateTime]::UtcNow.AddSeconds(30) }
-                      if ([DateTime]::UtcNow -ge $afterUntil) { break }
+                      if (-not $afterUntil) { $afterUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 30000 }
+                      if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge $afterUntil) { break }
                   }
                   Start-Sleep -Seconds 1
               }
@@ -82,7 +87,7 @@ jobs:
           $monitorProcess = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$bootstrapPath,'-MonitorScript',$monitorScriptPath,'-LogPath',$monitorLog,'-StopPath',$stopFile,'-Text',$koreanText)
           Set-Content -LiteralPath $pidFile -Value $monitorProcess.Id -Encoding ASCII
           Start-Sleep -Seconds 2
-          Set-Content -LiteralPath $deploymentStart -Value ([DateTime]::UtcNow.ToString('o')) -Encoding ASCII
+          Set-Content -LiteralPath $deploymentStart -Value ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) -Encoding ASCII
 
       - uses: docker/login-action@v3
         with:
@@ -165,7 +170,7 @@ jobs:
 
       - name: Mark deployment end
         if: always()
-        run: Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'language-detector-deployment.end') -Value ([DateTime]::UtcNow.ToString('o')) -Encoding ASCII
+        run: Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'language-detector-deployment.end') -Value ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) -Encoding ASCII
 
       - name: Stop monitor and write summary
         if: always()
@@ -183,21 +188,21 @@ jobs:
           if (Test-Path -LiteralPath $log) { $rows = @(Import-Csv -LiteralPath $log) }
           $startPath = Join-Path $env:RUNNER_TEMP 'language-detector-deployment.start'
           $endPath = Join-Path $env:RUNNER_TEMP 'language-detector-deployment.end'
-          $start = if (Test-Path -LiteralPath $startPath) { [DateTime]::Parse((Get-Content $startPath)).ToUniversalTime() } else { [DateTime]::UtcNow }
-          $end = if (Test-Path -LiteralPath $endPath) { [DateTime]::Parse((Get-Content $endPath)).ToUniversalTime() } else { [DateTime]::UtcNow }
-          $after = $end.AddSeconds(30)
+          $start = if (Test-Path -LiteralPath $startPath) { [int64](Get-Content $startPath) } else { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+          $end = if (Test-Path -LiteralPath $endPath) { [int64](Get-Content $endPath) } else { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+          $after = $end + 30000
           $success = @($rows | Where-Object { $_.valid -eq 'True' -and $_.http_status -eq '200' }).Count
           $failure = $rows.Count - $success
           $gaps = @()
-          for ($i = 1; $i -lt $rows.Count; $i++) { $gaps += (([DateTime]::Parse($rows[$i].start_utc) - [DateTime]::Parse($rows[$i-1].end_utc)).TotalSeconds) }
+          for ($i = 1; $i -lt $rows.Count; $i++) { $gaps += (([int64]$rows[$i].start_ms - [int64]$rows[$i-1].end_ms) / 1000.0) }
           $largestGap = if ($gaps.Count) { [Math]::Round(($gaps | Measure-Object -Maximum).Maximum, 2) } else { 0 }
-          function Phase([DateTime]$t) { if ($t -lt $start) { 'Before' } elseif ($t -le $end) { 'During' } elseif ($t -le $after) { 'After' } else { 'Other' } }
-          $summary = @('# Language Detector deployment monitor','',"Stable URL: http://127.0.0.1:8001",("Window (UTC): {0} to {1}; deployment: {2} to {3}; after: 30 seconds" -f $start,$after,$start,$end),'','| Phase | Requests ok/total | Representative | HTTP | Version |','|---|---:|---|---:|---|')
+          function Phase([int64]$t) { if ($t -lt $start) { 'Before' } elseif ($t -le $end) { 'During' } elseif ($t -le $after) { 'After' } else { 'Other' } }
+          $summary = @('# Language Detector deployment monitor','',"Stable URL: http://127.0.0.1:8001",("Window: Unix ms {0} to {1}; deployment: {2} to {3}; after: 30 seconds" -f $start,$after,$start,$end),'','| Phase | Requests ok/total | Representative request | HTTP | Version |','|---|---:|---|---:|---|')
           foreach ($phase in @('Before','During','After')) {
-              $phaseRows = @($rows | Where-Object { (Phase ([DateTime]::Parse($_.start_utc))) -eq $phase })
+              $phaseRows = @($rows | Where-Object { (Phase ([int64]$_.start_ms)) -eq $phase })
               $ok = @($phaseRows | Where-Object { $_.valid -eq 'True' -and $_.http_status -eq '200' }).Count
               $rep = if ($phaseRows.Count) { $phaseRows[0] } else { $null }
-              $repText = if ($rep) { "$($rep.response_ms) ms" } else { 'none' }
+              $repText = if ($rep) { "#$($rep.request_number) ($($rep.response_ms) ms)" } else { 'none' }
               $http = if ($rep) { $rep.http_status } else { '-' }
               $version = if ($rep) { $rep.model_version } else { '-' }
               $summary += "| $phase | $ok/$($phaseRows.Count) | $repText | $http | $version |"
